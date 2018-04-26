@@ -51,12 +51,12 @@ async def scan_until_complete(loop, scanner, result_handler, period, ending):
         await result_handler(result)
 
 
-async def write_to_database(conn, users):
+async def write_to_database(conn, cursor, users):
     """
     Write information in users to database.
 
     Args:
     conn -- Connection to database.
+    cursor -- Database cursor.
     users -- Dictionary with information.
     """
-    cursor = conn.cursor()
