@@ -1,20 +1,49 @@
-import sqlite3
-import scapy.all
+import os.path
+from datetime import datetime
+from sqlite3 import connect
+from scapy.all import arping, ARP
 
 
-def connect(dbase):
+# def connect_dbase(dbase):
+#     """
+#     Function connects to sqlite3 database and creates cursor.
+#
+#     Args:
+#     dbase -- Path to database file.
+#
+#     Returns:
+#     Tuple (connection, cursor).
+#     """
+#     conn = connect(dbase)
+#     cursor = conn.cursor()
+#     return conn, cursor
+
+
+def init_dbase(conn):
     """
-    Function connects to sqlite3 database and creates cursor.
+    Create tables users and times.
 
     Args:
-    dbase -- Path to database file.
-
-    Returns:
-    Tuple (connection, cursor).
+    conn -- Connection with database.
+    cursor -- Cursor from connection.
     """
-    conn = sqlite3.connect(dbase)
     cursor = conn.cursor()
-    return conn, cursor
+
+    cursor.execute("""
+    CREATE TABLE users(
+    id TEXT PRIMARY KEY,
+    mac TEXT)
+    """)
+    cursor.execute("""
+    CREATE TABLE times(
+    mac TEXT,
+    ip TEXT,
+    enter_time TEXT,
+    exit_time TEXT,
+    FOREIGN KEY(mac) REFERENCES users(mac))
+    """)
+
+    conn.commit()
 
 
 def scan_arp(addresses):
@@ -27,9 +56,12 @@ def scan_arp(addresses):
     Returns:
     Iterable of dictionaries with mac and ip addresses of users.
     """
-    answers, _ = scapy.all.arping(addresses, verbose=False)
-    users = (dict(mac=answer[1].getlayer(scapy.all.ARP).hwsrc, ip=answer[1].getlayer(scapy.all.ARP).psrc)
-             for answer in answers)
+    answers, _ = arping(addresses, verbose=False)
+    date = datetime.today()
+    users = {}
+    for answer in answers:
+        users[answer[1].getlayer(ARP).hwsrc] = dict(ip=answer[1].getlayer(ARP).psrc,
+                                                    date=date.isoformat(' ', 'seconds'))
     return users
 
 
@@ -51,12 +83,36 @@ async def scan_until_complete(loop, scanner, result_handler, period, ending):
         await result_handler(result)
 
 
-async def write_to_database(conn, cursor, users):
+async def write_to_database(conn, users, last_date):
     """
     Write information in users to database.
 
     Args:
     conn -- Connection to database.
-    cursor -- Database cursor.
     users -- Dictionary with information.
+    last_date -- Date of last scan.
     """
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT *
+    FROM times
+    WHERE exit_time IS NULL
+    """)
+    last_active = cursor.fetchall()
+    left_macs = []
+    for mac, ip, enter_time, exit_time in last_active:
+        if mac in users:
+            del users[mac]
+        else:
+            left_macs.append(mac)
+    place_string = '(' + ', '.join(len(left_macs)*'?') + ')'
+    cursor.execute("""
+    UPDATE times
+    SET exit_time = ?
+    WHERE mac IN {} AND exit_time IS NULL
+    """.format(place_string), (last_date, *left_macs))
+    for mac, user in users.items():
+        cursor.execute("""
+        INSERT INTO times
+        VALUES(?, ?, ?, ?)
+        """, (mac, user['ip'], user['ip'], user['date'], None))
