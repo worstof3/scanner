@@ -8,12 +8,6 @@ import sys
 from datetime import datetime
 from functools import partial
 from scapy.all import arping, ARP
-"""
-Todo:
-
-Handling database file and date of last scan.
-Tests.
-"""
 
 
 def check_dbase(conn):
@@ -80,11 +74,12 @@ def scan_arp(addresses):
     answers, _ = arping(addresses, verbose=False)
     logging.info('Ended scanning.')
     date = datetime.today()
+    datestring = date.isoformat(' ', 'seconds')
     users = {}
     for answer in answers:
         users[answer[1].getlayer(ARP).hwsrc] = dict(ip=answer[1].getlayer(ARP).psrc,
-                                                    date=date.isoformat(' ', 'seconds'))
-    return users
+                                                    date=datestring)
+    return {'result': users, 'date': datestring}
 
 
 async def scan_until_complete(loop, scanner, result_handler, period, ending):
@@ -105,7 +100,7 @@ async def scan_until_complete(loop, scanner, result_handler, period, ending):
         await result_handler(result)
 
 
-async def write_to_database(users, conn, last_date, lock):
+async def write_to_database(result, conn, period, lock):
     """
     Write information in users to database.
 
@@ -120,28 +115,24 @@ async def write_to_database(users, conn, last_date, lock):
         cursor.execute("""
         SELECT *
         FROM times
-        WHERE exit_time IS NULL
-        """)
+        WHERE datetime(exit_time, ?) >= datetime(?) 
+        """, (f'+{period + 2} second', result['date']))
         last_active = cursor.fetchall()
-        left_macs = []
         for mac, ip, enter_time, exit_time in last_active:
-            if mac in users:
-                del users[mac]
-            else:
-                left_macs.append(mac)
-        place_string = '(' + ', '.join(len(left_macs)*'?') + ')'
-        cursor.execute("""
-        UPDATE times
-        SET exit_time = ?
-        WHERE mac IN {} AND exit_time IS NULL
-        """.format(place_string), (last_date, *left_macs))
+            if mac in result['result']:
+                cursor.execute("""
+                UPDATE times
+                SET exit_time = ?
+                WHERE mac = ?
+                """, (result['date'], mac))
+                del result['result'][mac]
         cursor.execute("""
         SELECT *
         FROM users
         """)
         known_users = dict(cursor.fetchall())
         users_count = len(known_users)
-        for mac, user in users.items():
+        for mac, user in result['result'].items():
             if mac not in known_users:
                 cursor.execute("""
                 INSERT INTO users
@@ -151,7 +142,7 @@ async def write_to_database(users, conn, last_date, lock):
             cursor.execute("""
             INSERT INTO times
             VALUES(?, ?, ?, ?)
-            """, (mac, user['ip'], user['date'], None))
+            """, (mac, user['ip'], user['date'], user['date']))
         conn.commit()
 
 
@@ -182,7 +173,7 @@ def main():
     conn = sqlite3.connect(config['DEFAULT']['database'])
     if not check_dbase(conn):
         init_dbase(conn)
-    result_handler = partial(write_to_database, conn=conn, last_date=datetime(2018, 4, 28, 3, 23, 0), lock=lock)
+    result_handler = partial(write_to_database, conn=conn, period=int(args.period), lock=lock)
 
     try:
         scanning = scan_until_complete(loop, scanner_coro, result_handler, int(args.period), ending)
