@@ -1,182 +1,57 @@
+"""
+Main script for scanner.
+
+Functions:
+main -- Script function.
+"""
+
+
 from argparse import ArgumentParser, SUPPRESS
 import asyncio
-import configparser
 import logging
 import os
 import sqlite3
 import sys
-from datetime import datetime
 from functools import partial
-from scapy.all import arping, ARP
-
-
-def check_dbase(conn):
-    """
-    Check if database contains tables users and times.
-
-    Args:
-    conn -- Connection to database.
-    """
-    logging.info('Checking database.')
-    cursor = conn.cursor()
-    cursor.execute("""
-    SELECT name
-    FROM sqlite_master
-    WHERE type = 'table'
-    """)
-    tables = cursor.fetchall()
-    if ('users', ) in tables and ('times', ) in tables:
-        logging.info('Database has users and times tables.')
-        return True
-    else:
-        logging.info("Database doesn't have users or times table.")
-        return False
-
-
-def init_dbase(conn):
-    """
-    Create tables users and times.
-
-    Args:
-    conn -- Connection with database.
-    cursor -- Cursor from connection.
-    """
-    logging.info('Creating users and times tables.')
-    cursor = conn.cursor()
-    cursor.execute("""
-    CREATE TABLE users(
-    mac TEXT PRIMARY KEY,
-    name TEXT)
-    """)
-    cursor.execute("""
-    CREATE TABLE times(
-    mac TEXT,
-    ip TEXT,
-    enter_time TEXT,
-    exit_time TEXT,
-    FOREIGN KEY(mac) REFERENCES users(mac))
-    """)
-
-    conn.commit()
-
-
-def scan_arp(addresses):
-    """
-    Function calls arping from scapy and returns information about active users.
-
-    Args:
-    addresses -- Range of addresses.
-
-    Returns:
-    Iterable of dictionaries with mac and ip addresses of users.
-    """
-    logging.info('Starting scanning.')
-    answers, _ = arping(addresses, verbose=False)
-    logging.info('Ended scanning.')
-    date = datetime.today()
-    datestring = date.isoformat(' ', 'seconds')
-    users = {}
-    for answer in answers:
-        users[answer[1].getlayer(ARP).hwsrc] = dict(ip=answer[1].getlayer(ARP).psrc,
-                                                    date=datestring)
-    return {'result': users, 'date': datestring}
-
-
-async def scan_until_complete(loop, scanner, result_handler, period, ending):
-    """
-    Calls scanner periodically until ending is done.
-
-    Args:
-    loop -- Event loop.
-    scanner -- Scanning coroutine function, it will be called without arguments.
-    result_handler -- Coroutine function handling result of scanning, it will be called with return value of scanner.
-    period -- Period of time (in seconds) after which coroutine will be called again.
-    ending -- Asyncio future, if it's done coroutine won't be called again.
-    """
-    if not ending.done():
-        next_time = scan_until_complete(loop, scanner, result_handler, period, ending)
-        loop.call_later(period, loop.create_task, next_time)
-        result = await scanner()
-        await result_handler(result)
-
-
-async def write_to_database(result, conn, period, lock):
-    """
-    Write information in users to database.
-
-    Args:
-    conn -- Connection to database.
-    users -- Dictionary with information.
-    last_date -- Date of last scan.
-    """
-    cursor = conn.cursor()
-    async with lock:
-        logging.info('Writing results to database.')
-        cursor.execute("""
-        SELECT *
-        FROM times
-        WHERE datetime(exit_time, ?) >= datetime(?) 
-        """, (f'+{period + 2} second', result['date']))
-        last_active = cursor.fetchall()
-        for mac, ip, enter_time, exit_time in last_active:
-            if mac in result['result']:
-                cursor.execute("""
-                UPDATE times
-                SET exit_time = ?
-                WHERE mac = ?
-                """, (result['date'], mac))
-                del result['result'][mac]
-        cursor.execute("""
-        SELECT *
-        FROM users
-        """)
-        known_users = dict(cursor.fetchall())
-        users_count = len(known_users)
-        for mac, user in result['result'].items():
-            if mac not in known_users:
-                cursor.execute("""
-                INSERT INTO users
-                VALUES(?, ?)
-                """, (mac, f'new_user_{users_count}'))
-                users_count += 1
-            cursor.execute("""
-            INSERT INTO times
-            VALUES(?, ?, ?, ?)
-            """, (mac, user['ip'], user['date'], user['date']))
-        conn.commit()
+from . import scanoperations
 
 
 def main():
+    """Script function."""
+    # Parsing arguments.
+    parser = ArgumentParser(description='Network scanner.')
+    parser.add_argument('addresses', default=SUPPRESS, help='Addresses to scan.')
+    parser.add_argument('period', default=SUPPRESS, help='Period of scan.')
+    parser.add_argument('dbase_path', default=SUPPRESS, help='Path to database file.')
+    parser.add_argument('-v', '--verbose', help='Verbose output.', action='store_true')
+    args = parser.parse_args()
+
+    # Checking root permissions (they are needed to send ARP packets.)
     euid = os.geteuid()
     if euid != 0:
         args = ['sudo', sys.executable] + sys.argv + [os.environ]
         os.execlpe('sudo', *args)
-    parser = ArgumentParser(description='Network scanner.')
-    parser.add_argument('addresses', default=SUPPRESS, help='Addresses to scan.')
-    parser.add_argument('period', default=SUPPRESS, help='Period of scan.')
-    parser.add_argument('-c', '--config', default='scanner.ini', help='Path to config file.')
-    parser.add_argument('-v', '--verbose', help='Verbose output.', action='store_true')
-    args = parser.parse_args()
 
+    # Logging config.
     logging_config = {'format': '%(asctime)s: %(message)s'}
     if args.verbose:
         logging_config['level'] = logging.INFO
     logging.basicConfig(**logging_config)
 
+    # Initializing.
     loop = asyncio.get_event_loop()
     lock = asyncio.Lock()
     ending = asyncio.Future()
-    scanner = partial(scan_arp, args.addresses)
+    scanner = partial(scanoperations.scan_arp, args.addresses)
     scanner_coro = partial(loop.run_in_executor, None, scanner)
-    config = configparser.ConfigParser()
-    config.read(args.config)
-    conn = sqlite3.connect(config['DEFAULT']['database'])
-    if not check_dbase(conn):
-        init_dbase(conn)
-    result_handler = partial(write_to_database, conn=conn, period=int(args.period), lock=lock)
+    conn = sqlite3.connect(args.dbase_path)
+    if not scanoperations.check_dbase(conn):
+        scanoperations.init_dbase(conn)
+    result_handler = partial(scanoperations.write_to_dbase, conn=conn, lock=lock)
 
+    # Running scanner.
     try:
-        scanning = scan_until_complete(loop, scanner_coro, result_handler, int(args.period), ending)
+        scanning = scanoperations.scan_until_complete(loop, scanner_coro, result_handler, int(args.period), ending)
         loop.run_until_complete(scanning)
         loop.run_forever()
     except KeyboardInterrupt:
